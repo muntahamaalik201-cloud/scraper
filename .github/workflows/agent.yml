@@ -1,11 +1,9 @@
 name: Run Two Scraper Agents
 
 on:
-  
   workflow_dispatch:
   schedule:
     - cron: '0 */6 * * *'
-  
 
 jobs:
   top-agent:
@@ -33,6 +31,8 @@ jobs:
           playwright install chromium
 
       - name: Run top agent
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
           python agent_runner.py top
 
@@ -61,6 +61,8 @@ jobs:
           playwright install chromium
 
       - name: Run bottom agent
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
           python agent_runner.py bottom
 
@@ -90,5 +92,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Check remaining rows
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python check_remaining.py
-    
