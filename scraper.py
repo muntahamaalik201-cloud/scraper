@@ -6,6 +6,7 @@ from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from html import unescape
 import difflib
 import re
 
@@ -52,6 +53,8 @@ INSTALL_SELECTORS = [
     'a:has-text("Install")',
     'a:has-text("Get")',
     'a:has-text("Download")',
+    "a[href]",
+    "a[data-href]",
 ]
 
 
@@ -108,26 +111,71 @@ def extract_package_name(app_link):
         return "N/A"
     
     try:
-        # Google Play Store format: ...?id=com.example.app
-        if "play.google.com" in app_link.lower():
-            parsed = urlparse(app_link)
-            query = parse_qs(parsed.query)
-            package_name = query.get("id", [None])[0]
-            if package_name:
-                return package_name
-        
-        # Apple App Store format: ...app/app-name/id123456789
-        if "apps.apple.com" in app_link.lower():
-            # Extract the ID from the URL path
-            match = re.search(r"/id(\d+)", app_link)
-            if match:
-                return f"id{match.group(1)}"
-        
-        # If we can't extract, return N/A
+        for candidate in decoded_url_variants(app_link):
+            lowered = candidate.lower()
+
+            # Google Play URL, including nested/escaped ad click destinations.
+            if "play.google.com" in lowered or "market://" in lowered:
+                parsed = urlparse(candidate)
+                package_name = parse_qs(parsed.query).get("id", [None])[0]
+                if package_name and _is_valid_pkg(package_name):
+                    return package_name
+
+            # A nested store URL is sometimes present only as an escaped string.
+            package_match = re.search(
+                r"(?:[?&]id=|[?&]package=)([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)",
+                candidate,
+                re.IGNORECASE,
+            )
+            if package_match and _is_valid_pkg(package_match.group(1)):
+                return package_match.group(1)
+
+            if "apps.apple.com" in lowered or "itunes.apple.com" in lowered:
+                match = re.search(r"/id(\d+)", candidate)
+                if match:
+                    return f"id{match.group(1)}"
+
         return "N/A"
-    
     except Exception:
         return "N/A"
+
+
+def decoded_url_variants(value, max_items=40):
+    """Return nested URL encodings found in Google ad click-through links."""
+    if not value:
+        return []
+
+    found = []
+    pending = [str(value)]
+    seen = set()
+
+    while pending and len(seen) < max_items:
+        current = pending.pop(0).strip().strip("\"'")
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        found.append(current)
+
+        normalized = unescape(current)
+        normalized = (normalized.replace("\\u0026", "&")
+                                .replace("\\u003d", "=")
+                                .replace("\\/", "/")
+                                .replace("\\x26", "&")
+                                .replace("\\x3d", "="))
+        decoded = unquote(normalized)
+
+        for variant in (normalized, decoded):
+            if variant and variant not in seen:
+                pending.append(variant)
+
+        # Google commonly nests its destination in adurl/url/q/ds_dest_url.
+        try:
+            for values in parse_qs(urlparse(decoded).query, keep_blank_values=False).values():
+                pending.extend(values)
+        except Exception:
+            pass
+
+    return found
 
 
 # =========================
@@ -192,14 +240,21 @@ def extract_video_id_from_url(req_url):
                 if filename:
                     return filename
 
-        if "youtube.com/embed/" in url_lower:
-            return req_url.split("youtube.com/embed/")[1].split("?")[0].split("&")[0]
+        for player_host in ("youtube.com/embed/", "youtube-nocookie.com/embed/"):
+            if player_host in url_lower:
+                start = url_lower.index(player_host) + len(player_host)
+                return req_url[start:].split("?")[0].split("&")[0]
 
         if "youtube.com/watch" in url_lower:
             return query.get("v", [None])[0]
 
         if "youtu.be/" in url_lower:
             return req_url.split("youtu.be/")[1].split("?")[0].split("&")[0]
+
+        for key in ("video_id", "docid"):
+            value = query.get(key, [None])[0]
+            if value:
+                return value
 
     except Exception:
         return None
@@ -371,6 +426,54 @@ def detect_video_id(page, captured):
     return video_id
 
 
+def has_video_creative(page):
+    """Detect a video player even when its media URL is an opaque/blob URL."""
+    js = r"""
+    () => {
+        const visible = (el) => {
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width >= 80 && r.height >= 60 && r.bottom > 0 && r.right > 0 &&
+                   r.top < innerHeight && r.left < innerWidth &&
+                   s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+        };
+        if (Array.from(document.querySelectorAll('video, video source, source[type^="video/"]'))
+                 .some(el => visible(el.parentElement || el))) return true;
+
+        const markedPlayer = Array.from(document.querySelectorAll(
+            '[data-video-id], [data-video-url], [data-player], [class*="video-player"]'
+        )).some(el => visible(el));
+        if (markedPlayer) return true;
+
+        const playerFrame = Array.from(document.querySelectorAll('iframe[src]')).some(el => {
+            const src = (el.getAttribute('src') || '').toLowerCase();
+            return visible(el) && /youtube\.com|youtube-nocookie\.com|youtu\.be|vimeo\.com|video|player/.test(src);
+        });
+        if (playerFrame) return true;
+
+        const playControl = Array.from(document.querySelectorAll(
+            'button[aria-label], [role="button"][aria-label], button[title], [role="button"][title]'
+        )).some(el => {
+            const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
+            return visible(el) && /(^|\b)play(\b|$)|watch video/.test(label);
+        });
+        if (playControl) return true;
+
+        return performance.getEntriesByType('resource').some(entry =>
+            /googlevideo|videoplayback|\.(mp4|webm|mov|m4v|m3u8|m4s)(\?|$)/i.test(entry.name)
+        );
+    }
+    """
+
+    for target in [page] + [frame for frame in page.frames if frame != page.main_frame]:
+        try:
+            if target.evaluate(js):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # =========================
 # APP LINK LOGIC
 # =========================
@@ -385,23 +488,25 @@ def clean_googleadservices_link(href):
         href = "https:" + href
 
     try:
-        parsed = urlparse(href)
-        query = parse_qs(parsed.query)
+        for candidate in decoded_url_variants(href):
+            parsed = urlparse(candidate)
+            host = parsed.netloc.lower()
+            if any(domain in host for domain in (
+                "play.google.com", "apps.apple.com", "itunes.apple.com"
+            )) or parsed.scheme.lower() == "market":
+                return candidate
 
-        possible_keys = [
-            "adurl",
-            "url",
-            "q",
-            "u",
-            "ds_dest_url",
-            "destination",
-        ]
-
-        for key in possible_keys:
-            value = query.get(key, [None])[0]
-            if value:
-                return unquote(value)
-
+            query = parse_qs(parsed.query)
+            for key in ("adurl", "url", "q", "u", "ds_dest_url", "destination"):
+                value = query.get(key, [None])[0]
+                if value:
+                    for nested in decoded_url_variants(value):
+                        nested_url = urlparse(nested)
+                        nested_host = nested_url.netloc.lower()
+                        if any(domain in nested_host for domain in (
+                            "play.google.com", "apps.apple.com", "itunes.apple.com"
+                        )) or nested_url.scheme.lower() == "market":
+                            return nested
     except Exception:
         pass
 
@@ -412,13 +517,15 @@ def is_good_app_link(href):
     if not href:
         return False
 
-    href = href.lower()
-
-    return (
-        "googleadservices.com/pagead/aclk" in href
-        or "play.google.com" in href
-        or "apps.apple.com" in href
-        or "itunes.apple.com" in href
+    return any(
+        any(domain in candidate.lower() for domain in (
+            "googleadservices.com/pagead/aclk",
+            "play.google.com",
+            "apps.apple.com",
+            "itunes.apple.com",
+            "market://",
+        )) or extract_package_name(candidate) != "N/A"
+        for candidate in decoded_url_variants(href)
     )
 
 
@@ -803,10 +910,10 @@ def score_package_against_text(pkg, headline, description):
     partial_hits = list(dict.fromkeys(partial_hits))
     total_hits = len(set(exact_hits + partial_hits))
 
-    # One weak/fuzzy word is NOT enough now. This is the main image-ad false-match fix.
+    # One exact distinctive package segment often matches the app's displayed brand.
     if len(exact_hits) >= 2:
         score = max(score, 0.92)
-    elif len(exact_hits) == 1 and len(exact_hits[0]) >= 8:
+    elif len(exact_hits) == 1 and len(exact_hits[0]) >= 5:
         score = max(score, 0.78)
     elif total_hits >= 2:
         score = max(score, 0.76)
@@ -845,21 +952,26 @@ def get_best_matching_package(headline, description, package_list, min_score=MIN
 
 def decode_all(text):
     """Decode every encoding variant so no package name is missed."""
-    text = re.sub(r'\\x3[Dd]', '=', text)
-    text = re.sub(r'\\x26',    '&', text)
-    text = re.sub(r'\\x3[Ff]', '?', text)
-    text = re.sub(r'\\x2[Ff]', '/', text)
-    text = re.sub(r'\\u003[Dd]', '=', text)
-    text = re.sub(r'\\u0026',    '&', text)
-    text = re.sub(r'\\u003[Ff]', '?', text)
-    text = re.sub(r'%3[Dd]', '=', text, flags=re.I)
-    text = re.sub(r'%26',    '&', text, flags=re.I)
-    text = re.sub(r'%3[Ff]', '?', text, flags=re.I)
-    text = re.sub(r'%2[Ff]', '/', text, flags=re.I)
-    text = re.sub(r'%3[Aa]', ':', text, flags=re.I)
-    text = (text.replace('&amp;', '&').replace('&quot;', '"')
-                .replace('&#38;', '&').replace('&#61;', '=')
-                .replace('&#x3D;', '=').replace('&#x26;', '&'))
+    for _ in range(4):
+        previous = text
+        text = re.sub(r'\\x3[Dd]', '=', text)
+        text = re.sub(r'\\x26',    '&', text)
+        text = re.sub(r'\\x3[Ff]', '?', text)
+        text = re.sub(r'\\x2[Ff]', '/', text)
+        text = re.sub(r'\\u003[Dd]', '=', text)
+        text = re.sub(r'\\u0026',    '&', text)
+        text = re.sub(r'\\u003[Ff]', '?', text)
+        text = re.sub(r'%25', '%', text, flags=re.I)
+        text = re.sub(r'%3[Dd]', '=', text, flags=re.I)
+        text = re.sub(r'%26',    '&', text, flags=re.I)
+        text = re.sub(r'%3[Ff]', '?', text, flags=re.I)
+        text = re.sub(r'%2[Ff]', '/', text, flags=re.I)
+        text = re.sub(r'%3[Aa]', ':', text, flags=re.I)
+        text = re.sub(r'%2[Ee]', '.', text, flags=re.I)
+        text = unquote(text)
+        text = unescape(text)
+        if text == previous:
+            break
     return text
 
 
@@ -874,7 +986,8 @@ _SKIP_PFX = re.compile(
 
 def _is_valid_pkg(pkg):
     parts = pkg.split('.')
-    if len(parts) < 3 or len(pkg) < 8:  return False
+    # Android application IDs need at least two dot-separated identifiers.
+    if len(parts) < 2 or len(pkg) < 5:  return False
     if _SKIP_EXT.search(pkg):            return False
     if _SKIP_PFX.match(pkg):             return False
     for p in parts:
@@ -889,11 +1002,11 @@ def extract_packages_from_text(raw_text):
 
     patterns = [
         r"""['"]appId['"]\s*:\s*['"]([A-Za-z][\w.]+)['"]""",
-        r"""play\.google\.com/store/apps/details[^\s'"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""market://[^\s'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl)['"\s]*:['"\s]*['"][^'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""[?&]package=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})"""
+        r"""play\.google\.com/store/apps/details[^\s'"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)""",
+        r"""market://[^\s'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)""",
+        r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl)['"\s]*:['"\s]*['"][^'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)""",
+        r"""[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)""",
+        r"""[?&]package=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)"""
     ]
 
     for pat in patterns:
@@ -904,53 +1017,53 @@ def extract_packages_from_text(raw_text):
 
     return candidates
 
-def extract_package_from_page(page):
+def extract_package_from_page(page, active_only=False):
     """
-    Scans strictly the rendered DOM and visible links. 
-    Removes the background network fetching that caused cross-contamination.
+    Extract package IDs from rendered creative data and links. When requested,
+    inspect the highest-ranked active creative frames first to reduce matches
+    against neighboring ads and page chrome.
     """
     collected_texts = []
 
-    for frame in page.frames:
+    targets = []
+    if active_only:
         try:
-            frame_html = frame.evaluate("() => document.documentElement.outerHTML")
+            targets = [item[1] for item in get_ranked_non_video_targets(page)[:4]]
+        except Exception:
+            targets = []
+
+    if not targets:
+        targets = list(page.frames)
+        targets.append(page)
+
+    for target in targets:
+        try:
+            frame_html = target.evaluate("() => document.documentElement.outerHTML")
             if frame_html and len(frame_html) > 200:
                 collected_texts.append(frame_html)
 
-            hrefs = frame.evaluate("""
+            hrefs = target.evaluate("""
                 () => Array.from(document.querySelectorAll('a[href]'))
                            .map(a => a.href).filter(Boolean)
             """)
             if hrefs:
                 collected_texts.append('\n'.join(hrefs))
 
-            visible = frame.evaluate("() => document.body ? document.body.innerText : ''")
+            visible = target.evaluate("() => document.body ? document.body.innerText : ''")
             if visible:
                 collected_texts.append(visible)
 
         except Exception:
             continue
 
-    try:
-        visible = page.evaluate("() => document.body ? document.body.innerText : ''")
-        if visible:
-            collected_texts.append(visible)
-        
-        hrefs = page.evaluate("""
-            () => Array.from(document.querySelectorAll('a[href]'))
-                       .map(a => a.href).filter(Boolean)
-        """)
-        if hrefs:
-            collected_texts.append('\n'.join(hrefs))
-            
-        main_html = page.evaluate("() => document.documentElement.outerHTML")
-        if main_html:
-            collected_texts.append(main_html)
-    except Exception:
-        pass
-
     combined = '\n'.join(collected_texts)
-    return extract_packages_from_text(combined)
+    packages = extract_packages_from_text(combined)
+
+    # If ranking produced no package-bearing creative frame, retain the broader
+    # DOM fallback so delayed/opaque preview markup can still be recovered.
+    if active_only and not packages:
+        return extract_package_from_page(page, active_only=False)
+    return packages
 
 def extract_advertiser_from_page(page):
     try:
@@ -1163,41 +1276,46 @@ def get_ranked_non_video_targets(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extracts headline and description for non-video ads.
-    - Prefers visible elements from the active creative (main DOM).
-    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
-    - Falls back to iframe if necessary.
-    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
+    Extracts visible headline and description from the highest-ranked creative frame.
+    Uses multiple Google creative selectors and allows offscreen text elements.
     """
     js = r"""
     () => {
         const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-
-        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             return rect.width > 0 && rect.height > 0 &&
-                   style.visibility !== 'hidden' &&
-                   style.display !== 'none' &&
-                   style.opacity !== '0';
+                   style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+        };
+        const collect = (selectors, minLength, maxLength) => {
+            const result = [];
+            for (const selector of selectors) {
+                for (const el of document.querySelectorAll(selector)) {
+                    if (!isVisible(el)) continue;
+                    const text = cleanText(el.innerText || el.textContent);
+                    if (text.length < minLength || text.length > maxLength ||
+                        text.includes('{{') || /^(install|get|download|learn more|sign in)$/i.test(text)) continue;
+                    if (!result.includes(text)) result.push(text);
+                }
+            }
+            return result;
         };
 
-        let headline = "N/A";
-        let description = "N/A";
+        const headlines = collect([
+            '[class*="-e-15"]', '[class*="headline"]',
+            '[aria-label*="Headline" i]', 'div[role="link"] span',
+            'div.HFTpmd-WsjYwc-hgDUwe', 'div.cS4Vcb-vnv8ic'
+        ], 3, 180);
+        const descriptions = collect([
+            '[class*="-e-67"]', '[class*="long-description"]',
+            '[class*="description"]', '[aria-label*="Description" i]',
+            'div.HFTpmd-WsjYwc-hgDUwe', 'div.cS4Vcb-vnv8ic'
+        ], 8, 260);
 
-        // 1️⃣ Main visible creative first
-        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (headlineEl && isVisible(headlineEl)) {
-            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
-        }
-
-        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (descriptionEl && isVisible(descriptionEl)) {
-            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
-        }
-
+        const headline = headlines[0] || 'N/A';
+        const description = descriptions.find(text => text !== headline) || 'N/A';
         return { headline, description };
     }
     """
@@ -1214,16 +1332,15 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        # 1) Check main page DOM first (active visible creative)
-        data = read_target(page)
-        if data:
-            return data
+        try:
+            targets = [item[1] for item in get_ranked_non_video_targets(page)]
+        except Exception:
+            targets = []
+        if not targets:
+            targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
 
-        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            data = read_target(frame)
+        for target in targets:
+            data = read_target(target)
             if data:
                 return data
 
@@ -1363,27 +1480,43 @@ def scrape_single_url(url_row):
 
             # VIDEO LOGIC: same original flow. No text/image extraction runs before this.
             video_id = detect_video_id(page, captured)
+            video_creative = video_id != "N/A" or has_video_creative(page)
             video_time = get_exact_time()
 
             # =========================
             # VIDEO AD PATH
             # =========================
-            if video_id != "N/A":
-                print(f"🎬 Row {row_num}: video ID found first: {video_id}")
+            if video_creative:
+                print(f"🎬 Row {row_num}: video creative found (video ID: {video_id})")
 
                 app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
                 app_link_time = get_exact_time()
 
                 headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+                if headline == "N/A" and description == "N/A":
+                    text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=5)
+                    headline = clean_text(text_data.get("headline"))
+                    description = clean_text(text_data.get("description"))
+
+                package_name = extract_package_name(app_link)
+                if package_name == "N/A":
+                    # Some video previews expose the app destination in page data
+                    # rather than as a clickable install button.
+                    page_packages = extract_package_from_page(page, active_only=True)
+                    matched_package, match_score = get_best_matching_package(
+                        headline, description, page_packages
+                    )
+                    if matched_package:
+                        package_name = matched_package
+                        app_link = f"https://play.google.com/store/apps/details?id={matched_package}"
+                        print(f"📦 Row {row_num}: video package matched from creative text ({match_score})")
 
                 if app_link == "N/A":
                     status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
-                    message = "Video ID found, but exact visible install link not found"
+                    message = "Video creative found, but no app install destination was resolved"
                 else:
                     status = "SUCCESS"
-                    message = "Video ID and app link saved"
-
-                package_name = extract_package_name(app_link)
+                    message = "Video creative and app destination saved"
 
                 data = [
                     advertiser,
@@ -1391,7 +1524,7 @@ def scrape_single_url(url_row):
                     url,
                     app_link,
                     app_link_time,
-                    video_id,      # Column F: actual video ID for video ads
+                    video_id if video_id != "N/A" else "VIDEO",
                     video_time
                 ]
 
@@ -1408,7 +1541,7 @@ def scrape_single_url(url_row):
                     message=message
                 )
 
-                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + text")
+                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + media marker + text")
                 return
 
             # =========================
@@ -1476,7 +1609,7 @@ def scrape_single_url(url_row):
 
                 if has_text:
                     print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
-                    all_found_packages = extract_package_from_page(page)
+                    all_found_packages = extract_package_from_page(page, active_only=True)
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
                 if package_name:
