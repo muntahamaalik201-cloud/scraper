@@ -55,6 +55,10 @@ INSTALL_SELECTORS = [
     'a:has-text("Download")',
     "a[href]",
     "a[data-href]",
+    "[data-url]",
+    "[data-destination-url]",
+    "[data-click-url]",
+    '[role="link"]',
 ]
 
 
@@ -427,41 +431,41 @@ def detect_video_id(page, captured):
 
 
 def has_video_creative(page):
-    """Detect a video player even when its media URL is an opaque/blob URL."""
+    """Detect visible video media/player content, independent of Google's format label."""
     js = r"""
     () => {
-        const visible = (el) => {
+        const visibleSized = (el, minWidth = 120, minHeight = 80) => {
+            if (!el) return false;
             const r = el.getBoundingClientRect();
             const s = getComputedStyle(el);
-            return r.width >= 80 && r.height >= 60 && r.bottom > 0 && r.right > 0 &&
+            return r.width >= minWidth && r.height >= minHeight && r.bottom > 0 && r.right > 0 &&
                    r.top < innerHeight && r.left < innerWidth &&
                    s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
         };
-        if (Array.from(document.querySelectorAll('video, video source, source[type^="video/"]'))
-                 .some(el => visible(el.parentElement || el))) return true;
 
-        const markedPlayer = Array.from(document.querySelectorAll(
-            '[data-video-id], [data-video-url], [data-player], [class*="video-player"]'
-        )).some(el => visible(el));
-        if (markedPlayer) return true;
+        if (Array.from(document.querySelectorAll('video')).some(el => visibleSized(el))) return true;
 
         const playerFrame = Array.from(document.querySelectorAll('iframe[src]')).some(el => {
-            const src = (el.getAttribute('src') || '').toLowerCase();
-            return visible(el) && /youtube\.com|youtube-nocookie\.com|youtu\.be|vimeo\.com|video|player/.test(src);
+            if (!visibleSized(el)) return false;
+            let src = '';
+            try { src = new URL(el.getAttribute('src') || '', location.href).href.toLowerCase(); }
+            catch (_) { src = (el.getAttribute('src') || '').toLowerCase(); }
+            return /youtube\.com\/embed|youtube-nocookie\.com\/embed|youtu\.be\/|player\.vimeo\.com\/video|vimeo\.com\/video|googlevideo\.com|(?:^|\/)video(?:\/|[?#])|(?:^|\/)player(?:\/|[?#])/.test(src);
         });
         if (playerFrame) return true;
 
-        const playControl = Array.from(document.querySelectorAll(
+        const markedPlayer = Array.from(document.querySelectorAll('[class*="video-player"]'))
+            .some(el => visibleSized(el) &&
+            !!el.querySelector('video, canvas, [aria-label*="play" i], [title*="play" i]'));
+        if (markedPlayer) return true;
+
+        return Array.from(document.querySelectorAll(
             'button[aria-label], [role="button"][aria-label], button[title], [role="button"][title]'
         )).some(el => {
+            if (!visibleSized(el, 20, 20)) return false;
             const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
-            return visible(el) && /(^|\b)play(\b|$)|watch video/.test(label);
+            return /play video|watch video|play ad/.test(label);
         });
-        if (playControl) return true;
-
-        return performance.getEntriesByType('resource').some(entry =>
-            /googlevideo|videoplayback|\.(mp4|webm|mov|m4v|m3u8|m4s)(\?|$)/i.test(entry.name)
-        );
     }
     """
 
@@ -541,13 +545,30 @@ def get_visible_install_candidates_from_target(target):
                 try:
                     el = loc.nth(i)
 
-                    href = el.get_attribute("href", timeout=1500)
-                    data_href = el.get_attribute("data-href", timeout=1000)
+                    possible_hrefs = []
+                    for attribute in (
+                        "href", "data-href", "data-url", "data-destination-url",
+                        "data-click-url", "data-redirect-url", "data-ad-url"
+                    ):
+                        try:
+                            value = el.get_attribute(attribute, timeout=1000)
+                            if value:
+                                possible_hrefs.append(value)
+                        except Exception:
+                            continue
 
-                    final_href = href or data_href
+                    try:
+                        onclick = el.get_attribute("onclick", timeout=1000) or ""
+                        possible_hrefs.extend(re.findall(r"https?://[^\s\"'<>]+", onclick))
+                    except Exception:
+                        pass
 
-                    if not final_href or not is_good_app_link(final_href):
+                    final_href = next((value for value in possible_hrefs if is_good_app_link(value)), None)
+                    if not final_href:
                         continue
+
+                    resolved_href = clean_googleadservices_link(final_href)
+                    resolved_package = extract_package_name(resolved_href)
 
                     box = el.bounding_box(timeout=1500)
 
@@ -564,6 +585,13 @@ def get_visible_install_candidates_from_target(target):
                         pass
 
                     score = 0
+
+                    if resolved_package != "N/A":
+                        score += 120
+                    elif any(domain in resolved_href.lower() for domain in (
+                        "play.google.com", "apps.apple.com", "itunes.apple.com", "market://"
+                    )):
+                        score += 60
 
                     try:
                         class_name = el.get_attribute("class", timeout=1000) or ""
@@ -590,7 +618,7 @@ def get_visible_install_candidates_from_target(target):
                         score -= 100
 
                     candidates.append({
-                        "href": final_href,
+                        "href": resolved_href,
                         "score": score,
                         "box": box,
                         "text": text,
@@ -868,7 +896,12 @@ def score_package_against_text(pkg, headline, description):
     STRICT score for non-video ads: compare package ONLY with visible headline + description.
     This prevents image ads from using random hidden package names from the page HTML.
     """
-    visible_raw = f"{headline or ''} {description or ''}"
+    visible_parts = [
+        str(value).strip()
+        for value in (headline, description)
+        if value and str(value).strip().lower() not in {"n/a", "none"}
+    ]
+    visible_raw = " ".join(visible_parts)
     visible_clean = clean_text_for_comparison(visible_raw)
     visible_words = split_words_for_comparison(visible_raw)
     visible_word_set = set(visible_words)
@@ -1002,6 +1035,8 @@ def extract_packages_from_text(raw_text):
 
     patterns = [
         r"""['"]appId['"]\s*:\s*['"]([A-Za-z][\w.]+)['"]""",
+        r"""['"](?:packageName|package_name|appPackage|androidPackageName)['"]\s*:\s*['"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)['"]""",
+        r"""data-(?:package-name|app-id|android-package)=['"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)['"]""",
         r"""play\.google\.com/store/apps/details[^\s'"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)""",
         r"""market://[^\s'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)""",
         r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl)['"\s]*:['"\s]*['"][^'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)""",
@@ -1029,6 +1064,8 @@ def extract_package_from_page(page, active_only=False):
     if active_only:
         try:
             targets = [item[1] for item in get_ranked_non_video_targets(page)[:4]]
+            if page not in targets:
+                targets.append(page)
         except Exception:
             targets = []
 
@@ -1360,8 +1397,8 @@ def is_valid_text_ad(headline, description):
 
 def has_visible_image_creative(page):
     """
-    Detects likely image/display creative for non-video ads.
-    Used only after video detection returns N/A.
+    Detect a substantial image in the active creative, excluding small app icons
+    and images belonging to surrounding Google page chrome.
     """
     js = r"""
     () => {
@@ -1400,14 +1437,15 @@ def has_visible_image_creative(page):
     """
 
     try:
-        if page.evaluate(js):
-            return True
+        targets = [item[1] for item in get_ranked_non_video_targets(page)[:4]]
     except Exception:
-        pass
+        targets = []
+    if not targets:
+        targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
 
-    for frame in page.frames:
+    for target in targets:
         try:
-            if frame.evaluate(js):
+            if target.evaluate(js):
                 return True
         except Exception:
             continue
@@ -1478,10 +1516,16 @@ def scrape_single_url(url_row):
 
             advertiser = extract_advertiser_from_page(page)
 
-            # VIDEO LOGIC: same original flow. No text/image extraction runs before this.
-            video_id = detect_video_id(page, captured)
-            video_creative = video_id != "N/A" or has_video_creative(page)
+            # Ignore Google's "Format: Video" label. A rendered player is required
+            # before we treat a creative as video or spend time probing for its ID.
+            video_creative = has_video_creative(page)
+            video_id = detect_video_id(page, captured) if video_creative else "N/A"
             video_time = get_exact_time()
+
+            text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+            headline = clean_text(text_data.get("headline"))
+            description = clean_text(text_data.get("description"))
+            has_text = is_valid_text_ad(headline, description)
 
             # =========================
             # VIDEO AD PATH
@@ -1492,11 +1536,8 @@ def scrape_single_url(url_row):
                 app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
                 app_link_time = get_exact_time()
 
-                headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
                 if headline == "N/A" and description == "N/A":
-                    text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=5)
-                    headline = clean_text(text_data.get("headline"))
-                    description = clean_text(text_data.get("description"))
+                    headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
 
                 package_name = extract_package_name(app_link)
                 if package_name == "N/A":
@@ -1549,18 +1590,18 @@ def scrape_single_url(url_row):
             # =========================
             print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-            text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
-            headline = clean_text(text_data.get("headline"))
-            description = clean_text(text_data.get("description"))
             process_time = get_exact_time()
-            has_text = is_valid_text_ad(headline, description)
 
             # First try visible install/app link from the active creative.
             visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
             visible_package = extract_package_name(visible_app_link)
 
             is_image_like = has_visible_image_creative(page)
-            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
+            ad_type = (
+                "image" if is_image_like
+                else "text" if has_text
+                else "N/A"
+            )
 
             if not has_text and visible_package == "N/A" and not is_image_like:
                 data = [
