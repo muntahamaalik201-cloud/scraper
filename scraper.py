@@ -1423,12 +1423,12 @@ def get_ranked_non_video_targets(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extracts visible headline and description from the highest-ranked creative frame.
-    Uses multiple Google creative selectors and allows offscreen text elements.
+    Extract visible copy from the active creative, using both Google selectors and
+    the text-card layout (app label, store badge, headline, description).
     """
     js = r"""
     () => {
-        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+        const cleanText = txt => (txt || '').replace(/\s+/g, ' ').trim();
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
@@ -1436,6 +1436,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             return rect.width > 0 && rect.height > 0 &&
                    style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
         };
+        const ignored = /^(install|get|download|learn more|sign in|google play|google play store|app store|apple app store|sponsored|ad)$/i;
         const collect = (selectors, minLength, maxLength) => {
             const result = [];
             for (const selector of selectors) {
@@ -1443,7 +1444,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
                     if (!isVisible(el)) continue;
                     const text = cleanText(el.innerText || el.textContent);
                     if (text.length < minLength || text.length > maxLength ||
-                        text.includes('{{') || /^(install|get|download|learn more|sign in)$/i.test(text)) continue;
+                        text.includes('{{') || ignored.test(text)) continue;
                     if (!result.includes(text)) result.push(text);
                 }
             }
@@ -1461,26 +1462,60 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             'div.HFTpmd-WsjYwc-hgDUwe', 'div.cS4Vcb-vnv8ic'
         ], 8, 260);
 
-        const headline = headlines[0] || 'N/A';
-        const description = descriptions.find(text => text !== headline) || 'N/A';
-        return { headline, description };
+        // In text ads, the copy is often plain text without stable class names.
+        // Read visible text lines around the app-store badge as a structural fallback.
+        const lines = (document.body ? document.body.innerText : '')
+            .split(/\n+/).map(cleanText).filter(Boolean);
+        const storeIndex = lines.findIndex(line => /google play|app store/i.test(line));
+        let appName = '';
+        let cardHeadline = '';
+        let cardDescription = '';
+        let textCard = false;
+
+        if (storeIndex >= 0) {
+            const storeLine = lines[storeIndex];
+            const storeMatch = storeLine.match(/google play(?: store)?|apple app store|app store/i);
+            if (storeMatch && storeMatch.index > 0) {
+                appName = cleanText(storeLine.slice(0, storeMatch.index));
+            }
+            if (!appName && storeIndex > 0 && lines[storeIndex - 1].length <= 80) {
+                appName = lines[storeIndex - 1];
+            }
+
+            const afterStore = lines.slice(storeIndex + 1).filter(line =>
+                line.length >= 3 && line.length <= 260 && !ignored.test(line) &&
+                !/ads transparency|see more ads|report this ad|last shown/i.test(line)
+            );
+            if (afterStore.length) {
+                cardHeadline = afterStore[0].slice(0, 180);
+                cardDescription = afterStore.find((line, index) => index > 0 && line !== cardHeadline) || '';
+                textCard = true;
+            }
+        }
+
+        const headline = cardHeadline || headlines[0] || 'N/A';
+        const description = cardDescription || descriptions.find(text => text !== headline) || 'N/A';
+        return { headline, description, app_name: appName, text_card: textCard };
     }
     """
 
     def read_target(target):
         try:
             data = target.evaluate(js)
-            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
+            if data:
                 return data
         except Exception:
             return None
         return None
 
     start_time = time.time()
+    first_result_time = None
+    best = {"headline": "N/A", "description": "N/A", "app_name": "", "text_card": False}
 
     while time.time() - start_time < max_wait_seconds:
         try:
-            targets = [item[1] for item in get_ranked_non_video_targets(page)]
+            ranked = get_ranked_non_video_targets(page)
+            targets = [item[1] for item in ranked]
         except Exception:
             targets = []
         if not targets:
@@ -1488,12 +1523,27 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
 
         for target in targets:
             data = read_target(target)
-            if data:
-                return data
+            if not data:
+                continue
+            for field in ("headline", "description"):
+                candidate = clean_text(data.get(field, "N/A"))
+                if best[field] == "N/A" and candidate != "N/A":
+                    best[field] = candidate
+            if not best["app_name"] and data.get("app_name"):
+                best["app_name"] = clean_text(data["app_name"])
+            best["text_card"] = best["text_card"] or bool(data.get("text_card"))
+
+        if best["headline"] != "N/A" and best["description"] != "N/A":
+            return best
+        if best["headline"] != "N/A" or best["description"] != "N/A":
+            if first_result_time is None:
+                first_result_time = time.time()
+            elif time.time() - first_result_time >= 3:
+                return best
 
         page.wait_for_timeout(1000)
 
-    return {"headline": "N/A", "description": "N/A"}
+    return best
 
 
 def extract_visible_app_name(page):
@@ -1530,11 +1580,16 @@ def extract_visible_app_name(page):
     }
     """
     try:
-        targets = [item[1] for item in get_ranked_non_video_targets(page)[:4]]
+        ranked = get_ranked_non_video_targets(page)
+        targets = [ranked[0][1]] if ranked else []
     except Exception:
         targets = []
     if not targets:
-        targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
+        if has_text:
+            # Do not let an unranked sibling/neighbor frame turn a text ad into an image ad.
+            targets = [page]
+        else:
+            targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
 
     for target in targets:
         try:
@@ -1626,7 +1681,8 @@ def has_visible_image_creative(page, has_text=False):
     """
 
     try:
-        targets = [item[1] for item in get_ranked_non_video_targets(page)[:4]]
+        ranked = get_ranked_non_video_targets(page)
+        targets = [ranked[0][1]] if ranked else []
     except Exception:
         targets = []
     if not targets:
@@ -1714,8 +1770,18 @@ def scrape_single_url(url_row):
             text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
+            if headline == "N/A" or description == "N/A":
+                fallback_headline, fallback_description = wait_and_extract_headline_description(
+                    page, max_wait_seconds=3
+                )
+                if headline == "N/A" and fallback_headline != "N/A":
+                    headline = clean_text(fallback_headline)
+                if description == "N/A" and fallback_description != "N/A":
+                    description = clean_text(fallback_description)
             has_text = is_valid_text_ad(headline, description)
-            app_name = extract_visible_app_name(page) if has_text else ""
+            app_name = clean_text(text_data.get("app_name"))
+            if not app_name and has_text:
+                app_name = extract_visible_app_name(page)
 
             # =========================
             # VIDEO AD PATH
@@ -1729,7 +1795,7 @@ def scrape_single_url(url_row):
                 app_link_time = get_exact_time()
 
                 if headline == "N/A" and description == "N/A":
-                    headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+                    headline, description = wait_and_extract_headline_description(page, max_wait_seconds=3)
                     app_name = app_name or extract_visible_app_name(page)
 
                 package_name = extract_package_name(app_link)
@@ -1800,10 +1866,13 @@ def scrape_single_url(url_row):
             )
             visible_package = extract_package_name(visible_app_link)
 
-            is_image_like = has_visible_image_creative(page, has_text=has_text)
+            is_image_like = (
+                has_visible_image_creative(page, has_text=has_text)
+                if not has_text else False
+            )
             ad_type = (
-                "image" if is_image_like
-                else "text" if has_text
+                "text" if has_text
+                else "image" if is_image_like
                 else "N/A"
             )
 
