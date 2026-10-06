@@ -3,7 +3,7 @@
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
 from playwright.sync_api import sync_playwright
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html import unescape
@@ -43,6 +43,8 @@ import sheets
 
 MAX_WORKERS = 2
 SHEET_LOCK = threading.Lock()
+PLAY_STORE_CACHE_LOCK = threading.Lock()
+PLAY_STORE_PACKAGE_CACHE = {}
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
 
@@ -533,7 +535,7 @@ def is_good_app_link(href):
     )
 
 
-def get_visible_install_candidates_from_target(target):
+def get_visible_install_candidates_from_target(target, headline="", description=""):
     candidates = []
 
     for selector in INSTALL_SELECTORS:
@@ -588,6 +590,9 @@ def get_visible_install_candidates_from_target(target):
 
                     if resolved_package != "N/A":
                         score += 120
+                        score += int(score_package_against_text(
+                            resolved_package, headline, description
+                        ) * 100)
                     elif any(domain in resolved_href.lower() for domain in (
                         "play.google.com", "apps.apple.com", "itunes.apple.com", "market://"
                     )):
@@ -633,7 +638,7 @@ def get_visible_install_candidates_from_target(target):
     return candidates
 
 
-def extract_visible_install_link(page):
+def extract_visible_install_link(page, headline="", description=""):
     """
     Extracts only the visible install button from the active creative.
     Does not scan random adservice links.
@@ -641,13 +646,13 @@ def extract_visible_install_link(page):
     all_candidates = []
 
     try:
-        all_candidates.extend(get_visible_install_candidates_from_target(page))
+        all_candidates.extend(get_visible_install_candidates_from_target(page, headline, description))
     except Exception:
         pass
 
     for frame in page.frames:
         try:
-            all_candidates.extend(get_visible_install_candidates_from_target(frame))
+            all_candidates.extend(get_visible_install_candidates_from_target(frame, headline, description))
         except Exception:
             continue
 
@@ -744,11 +749,11 @@ def extract_install_link_by_precise_js(page):
     return "N/A"
 
 
-def wait_and_extract_install_link(page, max_wait_seconds=35):
+def wait_and_extract_install_link(page, max_wait_seconds=35, headline="", description=""):
     start = time.time()
 
     while time.time() - start < max_wait_seconds:
-        app_link = extract_visible_install_link(page)
+        app_link = extract_visible_install_link(page, headline, description)
 
         if app_link != "N/A":
             return app_link
@@ -935,7 +940,11 @@ def score_package_against_text(pkg, headline, description):
             continue
 
         for word in visible_words:
-            if len(token) >= 5 and len(word) >= 5 and (token in word or word in token):
+            if (
+                len(token) >= 4
+                and len(word) >= 6
+                and (word.startswith(token) or (len(token) >= 6 and token in word))
+            ):
                 partial_hits.append(token)
                 break
 
@@ -948,6 +957,8 @@ def score_package_against_text(pkg, headline, description):
         score = max(score, 0.92)
     elif len(exact_hits) == 1 and len(exact_hits[0]) >= 5:
         score = max(score, 0.78)
+    elif len(partial_hits) == 1 and len(partial_hits[0]) >= 4:
+        score = max(score, 0.76)
     elif total_hits >= 2:
         score = max(score, 0.76)
 
@@ -980,6 +991,105 @@ def get_best_matching_package(headline, description, package_list, min_score=MIN
 
     if best_pkg and best_score >= min_score:
         return best_pkg, best_score
+
+    return None, best_score
+
+
+def lookup_package_from_play_store(page, headline, description, app_name=""):
+    """Fallback for text ads whose rendered DOM hides the app destination/package ID."""
+    if (not headline or headline == "N/A") and not app_name.strip():
+        return None, 0.0
+
+    title_parts = re.split(r"\s*(?:\||:|\s[-–—]\s)\s*", headline, maxsplit=1)
+    title_query = app_name.strip() or (title_parts[0].strip() if title_parts else "")
+    title_words = re.findall(r"[\w]+", title_query, flags=re.UNICODE)
+    query = title_query if len(title_words) >= 2 else headline.strip()
+    if app_name.strip():
+        query = title_query
+    query = re.sub(r"\s+", " ", query)[:120]
+    if not query:
+        return None, 0.0
+
+    with PLAY_STORE_CACHE_LOCK:
+        cached = PLAY_STORE_PACKAGE_CACHE.get(query.lower())
+    if cached:
+        return cached
+
+    search_page = None
+    best_package = None
+    best_score = 0.0
+    generic_title_words = {"the", "app", "free", "best", "fast", "secure", "official"}
+    creative_words = set(re.findall(
+        r"[\w]+", f"{headline} {description or ''}".lower(), flags=re.UNICODE
+    )) - generic_title_words
+    creative_normalized = re.sub(r"[^\w]", "", headline.lower(), flags=re.UNICODE)
+
+    try:
+        search_page = page.context.new_page()
+        search_url = (
+            "https://play.google.com/store/search?" +
+            f"q={quote_plus(query)}&c=apps&hl=en&gl=US"
+        )
+        search_page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+
+        app_links = search_page.locator('a[href*="/store/apps/details?id="]')
+        try:
+            app_links.first.wait_for(state="visible", timeout=7000)
+        except Exception:
+            pass
+
+        for index in range(app_links.count()):
+            link = app_links.nth(index)
+            href = link.get_attribute("href", timeout=1000) or ""
+            package = extract_package_name(href)
+            if package == "N/A":
+                continue
+
+            try:
+                result_title = link.inner_text(timeout=1000).strip().splitlines()[0]
+            except Exception:
+                result_title = link.get_attribute("aria-label", timeout=1000) or ""
+            result_title = result_title.strip()
+            result_normalized = re.sub(r"[^\w]", "", result_title.lower(), flags=re.UNICODE)
+            result_words = set(re.findall(r"[\w]+", result_title.lower(), flags=re.UNICODE)) - generic_title_words
+
+            if not result_normalized or not result_words:
+                continue
+
+            if result_normalized in creative_normalized and (
+                len(result_words) >= 2 or len(result_normalized) >= 14
+            ):
+                score = 0.98
+            else:
+                overlap = len(result_words & creative_words) / max(len(result_words), 1)
+                score = min(overlap, 0.90) if len(result_words) >= 2 else 0.0
+
+            # The app card often shows a short display name (for example,
+            # "Calculator") separately from the longer ad headline. Accept an
+            # exact display-name result only when the package also matches the
+            # visible headline/description.
+            app_name_normalized = re.sub(r"[^\w]", "", app_name.lower(), flags=re.UNICODE)
+            if app_name_normalized and result_normalized == app_name_normalized:
+                package_fit = score_package_against_text(package, headline, description)
+                if package_fit >= 0.70:
+                    score = max(score, 0.70 + min(package_fit * 0.30, 0.28))
+
+            if score > best_score:
+                best_package = package
+                best_score = score
+
+        if best_package and best_score >= 0.80:
+            with PLAY_STORE_CACHE_LOCK:
+                PLAY_STORE_PACKAGE_CACHE[query.lower()] = (best_package, best_score)
+            return best_package, best_score
+    except Exception as error:
+        print(f"Play Store package lookup skipped for '{query}': {error}")
+    finally:
+        if search_page:
+            try:
+                search_page.close()
+            except Exception:
+                pass
 
     return None, best_score
 
@@ -1384,6 +1494,56 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
+
+
+def extract_visible_app_name(page):
+    """Read the app label immediately paired with a Google Play/App Store badge."""
+    js = r"""
+    () => {
+        const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+        const visible = el => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                   s.visibility !== 'hidden' && s.opacity !== '0';
+        };
+        const storeLabel = /^(google play|google play store|app store|apple app store)$/i;
+        for (const label of document.querySelectorAll('body *')) {
+            if (label.children.length || !visible(label)) continue;
+            if (!storeLabel.test(clean(label.innerText || label.textContent))) continue;
+            let parent = label.parentElement;
+            for (let depth = 0; parent && depth < 3; depth++, parent = parent.parentElement) {
+                const lines = (parent.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+                const index = lines.findIndex(line => storeLabel.test(line));
+                if (index > 0 && lines[index - 1].length <= 80) return lines[index - 1];
+            }
+        }
+        for (const selector of ['[class*="app-name"]', '[class*="app-title"]', '[data-testid*="app-name"]']) {
+            for (const el of document.querySelectorAll(selector)) {
+                if (!visible(el)) continue;
+                const value = clean(el.innerText || el.textContent);
+                if (value && value.length <= 80) return value;
+            }
+        }
+        return '';
+    }
+    """
+    try:
+        targets = [item[1] for item in get_ranked_non_video_targets(page)[:4]]
+    except Exception:
+        targets = []
+    if not targets:
+        targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
+
+    for target in targets:
+        try:
+            value = target.evaluate(js)
+            if value:
+                return clean_text(value)
+        except Exception:
+            continue
+    return ""
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1395,13 +1555,13 @@ def is_valid_text_ad(headline, description):
         return True
     return False
 
-def has_visible_image_creative(page):
+def has_visible_image_creative(page, has_text=False):
     """
     Detect a substantial image in the active creative, excluding small app icons
     and images belonging to surrounding Google page chrome.
     """
     js = r"""
-    () => {
+    (hasText) => {
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
@@ -1419,19 +1579,48 @@ def has_visible_image_creative(page):
             );
         };
 
-        const imageLike = Array.from(document.querySelectorAll('img, picture, canvas, svg')).some(el => {
-            const src = String(el.getAttribute('src') || '').toLowerCase();
-            const alt = String(el.getAttribute('alt') || '').toLowerCase();
-            if (src.includes('googlelogo') || alt.includes('google')) return false;
-            return isVisible(el);
-        });
+        const minImageWidth = hasText ? 180 : 120;
+        const minImageHeight = hasText ? 145 : 80;
+        const minImageArea = hasText ? 26000 : 9000;
+        const substantialAsset = (el, minArea = minImageArea) => {
+            if (!isVisible(el)) return false;
+            const rect = el.getBoundingClientRect();
+            const width = Math.max(rect.width, el.naturalWidth || el.width || 0);
+            const height = Math.max(rect.height, el.naturalHeight || el.height || 0);
+            const area = rect.width * rect.height;
+            const ratio = rect.width / Math.max(rect.height, 1);
+            if (area < minArea || rect.width < minImageWidth || rect.height < minImageHeight ||
+                width < minImageWidth || height < minImageHeight) return false;
+            // Ignore square app icons and logos; keep large square image creatives.
+            if (ratio >= 0.82 && ratio <= 1.22 && rect.width < 200) return false;
+            return true;
+        };
 
+        const imageLike = Array.from(document.querySelectorAll('img')).some(el => {
+            const src = String(el.currentSrc || el.getAttribute('src') || '').toLowerCase();
+            const alt = String(el.getAttribute('alt') || '').toLowerCase();
+            if (src.includes('googlelogo') || alt.includes('google') ||
+                /icon|avatar|logo|favicon/.test(alt + ' ' + src)) return false;
+            return substantialAsset(el);
+        });
         if (imageLike) return true;
 
-        return Array.from(document.querySelectorAll('*')).some(el => {
+        const canvasCreative = Array.from(document.querySelectorAll('canvas'))
+            .some(el => substantialAsset(el, Math.max(minImageArea, 40000)));
+        if (canvasCreative) return true;
+
+        const svgCreative = Array.from(document.querySelectorAll('svg')).some(el =>
+            substantialAsset(el, Math.max(minImageArea, 40000)) && !!el.querySelector('image')
+        );
+        if (svgCreative) return true;
+
+        const backgroundTargets = hasText
+            ? document.querySelectorAll('[role="img"], [class*="creative-image"], [class*="banner-image"], [class*="ad-image"]')
+            : document.querySelectorAll('*');
+        return Array.from(backgroundTargets).some(el => {
             if (!isVisible(el)) return false;
             const bg = window.getComputedStyle(el).backgroundImage || '';
-            return bg && bg !== 'none' && bg.includes('url(');
+            return bg !== 'none' && bg.includes('url(') && substantialAsset(el);
         });
     }
     """
@@ -1445,7 +1634,7 @@ def has_visible_image_creative(page):
 
     for target in targets:
         try:
-            if target.evaluate(js):
+            if target.evaluate(js, has_text):
                 return True
         except Exception:
             continue
@@ -1526,6 +1715,7 @@ def scrape_single_url(url_row):
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
             has_text = is_valid_text_ad(headline, description)
+            app_name = extract_visible_app_name(page) if has_text else ""
 
             # =========================
             # VIDEO AD PATH
@@ -1533,11 +1723,14 @@ def scrape_single_url(url_row):
             if video_creative:
                 print(f"🎬 Row {row_num}: video creative found (video ID: {video_id})")
 
-                app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
+                app_link = wait_and_extract_install_link(
+                    page, max_wait_seconds=35, headline=headline, description=description
+                )
                 app_link_time = get_exact_time()
 
                 if headline == "N/A" and description == "N/A":
                     headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+                    app_name = app_name or extract_visible_app_name(page)
 
                 package_name = extract_package_name(app_link)
                 if package_name == "N/A":
@@ -1547,6 +1740,15 @@ def scrape_single_url(url_row):
                     matched_package, match_score = get_best_matching_package(
                         headline, description, page_packages
                     )
+                    if not matched_package:
+                        broader_packages = extract_package_from_page(page, active_only=False)
+                        matched_package, match_score = get_best_matching_package(
+                            headline, description, broader_packages
+                        )
+                    if not matched_package:
+                        matched_package, match_score = lookup_package_from_play_store(
+                            page, headline, description, app_name=app_name
+                        )
                     if matched_package:
                         package_name = matched_package
                         app_link = f"https://play.google.com/store/apps/details?id={matched_package}"
@@ -1593,10 +1795,12 @@ def scrape_single_url(url_row):
             process_time = get_exact_time()
 
             # First try visible install/app link from the active creative.
-            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
+            visible_app_link = wait_and_extract_install_link(
+                page, max_wait_seconds=8, headline=headline, description=description
+            )
             visible_package = extract_package_name(visible_app_link)
 
-            is_image_like = has_visible_image_creative(page)
+            is_image_like = has_visible_image_creative(page, has_text=has_text)
             ad_type = (
                 "image" if is_image_like
                 else "text" if has_text
@@ -1652,6 +1856,16 @@ def scrape_single_url(url_row):
                     print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
                     all_found_packages = extract_package_from_page(page, active_only=True)
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+                    if not package_name:
+                        broader_packages = extract_package_from_page(page, active_only=False)
+                        package_name, match_score = get_best_matching_package(
+                            headline, description, broader_packages
+                        )
+                    if not package_name:
+                        print(f"🔎 Row {row_num}: no package ID in the creative; matching the app title in Google Play")
+                        package_name, match_score = lookup_package_from_play_store(
+                            page, headline, description, app_name=app_name
+                        )
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
