@@ -489,7 +489,20 @@ def has_video_creative(page):
     }
     """
 
-    for target in [page] + [frame for frame in page.frames if frame != page.main_frame]:
+    # Only inspect the centered creative preview and frames nested inside it.
+    # The Transparency page can contain unrelated video ads in other slots;
+    # those must not turn a static app-install creative into a video ad.
+    targets = get_active_ad_frames(page)
+    active_ids = {id(frame) for frame in targets}
+    for frame in page.frames:
+        parent = getattr(frame, "parent_frame", None)
+        while parent is not None:
+            if id(parent) in active_ids:
+                targets.append(frame)
+                break
+            parent = getattr(parent, "parent_frame", None)
+
+    for target in targets:
         try:
             if target.evaluate(js):
                 return True
@@ -657,12 +670,17 @@ def get_visible_install_candidates_from_target(target, headline="", description=
 
 
 def get_matching_creative_frames(page, headline="", description="", app_name=""):
-    """Return only adframes whose visible copy identifies the requested ad."""
+    """Return visible ad frames whose copy identifies the requested ad."""
     matches = []
     for frame in page.frames:
-        if frame == page.main_frame or "/adframe" not in (frame.url or "").lower():
+        frame_url = (frame.url or "").lower()
+        is_ad_frame = "/adframe" in frame_url or "html5_ctd_ad/discover.html" in frame_url
+        if frame == page.main_frame or not is_ad_frame:
             continue
         try:
+            box = _frame_parent_box(frame)
+            if not box or box.get("width", 0) < 120 or box.get("height", 0) < 70:
+                continue
             visible = frame.evaluate("() => document.body ? document.body.innerText : ''") or ""
             if looks_like_code_or_css(visible):
                 continue
@@ -675,7 +693,7 @@ def get_matching_creative_frames(page, headline="", description="", app_name="")
             continue
 
     if not matches:
-        return []
+        return get_active_ad_frames(page)
     matches.sort(key=lambda item: item[0], reverse=True)
     best_score = matches[0][0]
     return [frame for score, frame in matches if score == best_score]
@@ -1188,13 +1206,22 @@ def _packages_attached_to_creative_label(raw_text, headline, description, app_na
     return packages
 
 
+def _same_frame_box(first, second, tolerance=8):
+    if not first or not second:
+        return False
+    return all(
+        abs((first.get(key, 0) or 0) - (second.get(key, 0) or 0)) <= tolerance
+        for key in ("x", "y", "width", "height")
+    )
+
+
 def extract_package_from_page(
     page, headline="", description="", app_name=""
 ):
     """
-    Extract package IDs only from the iframe whose visible copy matches this
-    creative. Then accept IDs linked to that label in Google's serialized app
-    record, or an app-store destination from a visible install control.
+    Extract package IDs from the iframe whose visible copy matches this
+    creative, its same-creative frame ancestors, or a visible install control.
+    Ancestor package IDs must also match the creative's displayed copy.
     """
     # If equally matching frames disagree on app IDs, there is no safe choice.
     best_frames = get_matching_creative_frames(
@@ -1218,6 +1245,79 @@ def extract_package_from_page(
                     )
                     if extract_package_name(candidate["href"]) != "N/A"
                 )
+            if not packages:
+                # Discover creatives place their visible card in a child frame
+                # while the app destination is serialized by the containing
+                # Google SafeFrame. Walk only this creative's ancestor chain;
+                # never search arbitrary page frames for package IDs.
+                ancestor = getattr(target, "parent_frame", None)
+                while ancestor is not None and ancestor != page.main_frame:
+                    try:
+                        ancestor_html = ancestor.evaluate(
+                            "() => document.documentElement.outerHTML"
+                        ) or ""
+                        ancestor_packages = extract_packages_from_text(ancestor_html)
+                        if ancestor_packages:
+                            scored = [
+                                (score_package_against_text(
+                                    package, headline, description, app_name=app_name
+                                ), package)
+                                for package in ancestor_packages
+                            ]
+                            best_score = max(score for score, _ in scored)
+                            best_packages = {
+                                package for score, package in scored
+                                if score == best_score
+                            }
+                            if best_score >= MIN_PACKAGE_MATCH_SCORE and len(best_packages) == 1:
+                                packages.update(best_packages)
+                                break
+                    except Exception:
+                        pass
+                    ancestor = getattr(ancestor, "parent_frame", None)
+
+            if not packages:
+                # Discover-style ads render their copy in one iframe and keep
+                # the Google Play destination in a colocated safeframe. Accept
+                # that destination only when both frames occupy the same slot.
+                target_box = _frame_parent_box(target)
+                colocated_packages = set()
+                for sibling in page.frames:
+                    if sibling == target:
+                        continue
+                    if getattr(sibling, "parent_frame", None) != getattr(target, "parent_frame", None):
+                        continue
+                    sibling_box = _frame_parent_box(sibling)
+                    if not _same_frame_box(target_box, sibling_box):
+                        continue
+                    try:
+                        sibling_html = sibling.evaluate(
+                            "() => document.documentElement.outerHTML"
+                        ) or ""
+                        sibling_packages = extract_packages_from_text(sibling_html)
+                        if sibling_packages:
+                            # Google may expose the destination in an ordinary
+                            # nested ad frame whose URL does not contain the
+                            # word "safeframe". Geometry ties it to this exact
+                            # creative slot; copy matching ties its package to
+                            # this app instead of another ad on the page.
+                            colocated_packages.update(sibling_packages)
+                    except Exception:
+                        continue
+                if colocated_packages:
+                    scored = [
+                        (score_package_against_text(
+                            package, headline, description, app_name=app_name
+                        ), package)
+                        for package in colocated_packages
+                    ]
+                    best_score = max(score for score, _ in scored)
+                    best_packages = {
+                        package for score, package in scored
+                        if score == best_score
+                    }
+                    if best_score >= MIN_PACKAGE_MATCH_SCORE and len(best_packages) == 1:
+                        packages.update(best_packages)
             if not packages:
                 # Some active adframes expose the package only in a destination
                 # URL or another serialized field, rather than the typed app
@@ -1295,6 +1395,55 @@ def _frame_parent_box(frame):
         return box
     except Exception:
         return None
+
+
+def get_active_ad_frames(page):
+    """Find the visible centered ad preview, excluding surrounding ad slots."""
+    viewport = page.viewport_size or {"width": 1366, "height": 768}
+    page_width = viewport.get("width", 1366) or 1366
+    candidates = []
+
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        frame_url = (frame.url or "").lower()
+        if "/adframe" not in frame_url and "html5_ctd_ad/discover.html" not in frame_url:
+            continue
+
+        box = _frame_parent_box(frame)
+        if not box:
+            continue
+        width = box.get("width", 0) or 0
+        height = box.get("height", 0) or 0
+        x = box.get("x", -1)
+        y = box.get("y", -1)
+        center_x = x + width / 2
+
+        # The requested preview sits in the centered details column. This
+        # rejects off-screen video and ad slots around the Transparency page.
+        if width < 120 or height < 70 or not (page_width * 0.25 <= center_x <= page_width * 0.75):
+            continue
+        if y < 250 or y > 1100:
+            continue
+
+        try:
+            visible = frame.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            if looks_like_code_or_css(visible):
+                continue
+        except Exception:
+            continue
+
+        score = min((width * height) / 1000, 300)
+        score += 100
+        if 300 <= y <= 900:
+            score += 50
+        candidates.append((score, frame))
+
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score = candidates[0][0]
+    return [frame for score, frame in candidates if score == best_score]
 
 
 def _score_non_video_target(target):
@@ -1405,9 +1554,11 @@ def get_ranked_non_video_targets(page):
     for frame in page.frames:
         if frame == page.main_frame:
             continue
-        # Google embeds unrelated safeframe ads and many inert adframe variation
-        # templates. Only score frames that contain actual visible content.
-        if "googlesyndication.com" in (frame.url or "").lower():
+        # Exclude unrelated safeframe ad slots, but include visible Discover
+        # creatives: their large-format text ads use a separate gadget frame.
+        frame_url = (frame.url or "").lower()
+        is_discover_creative = "html5_ctd_ad/discover.html" in frame_url
+        if "googlesyndication.com" in frame_url and not is_discover_creative:
             continue
 
         parent_bonus = 0
@@ -1511,7 +1662,23 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         let cardDescription = '';
         let textCard = false;
 
-        if (storeIndex >= 0) {
+        // Discover-style app ads render copy as "Ad <headline>" followed by
+        // a short description and a "Google Play: NaN" badge. That badge is
+        // not the app name and the headline appears before it.
+        const discoverAdIndex = lines.findIndex(line =>
+            /^Ad\s+(?!details\b|transparency\b)/i.test(line)
+        );
+        if (discoverAdIndex >= 0) {
+            cardHeadline = cleanText(lines[discoverAdIndex].replace(/^Ad\s+/i, ''));
+            cardDescription = lines.slice(discoverAdIndex + 1).find(line =>
+                line.length >= 8 && line.length <= 260 &&
+                !/google play|app store/i.test(line) && !ignored.test(line) &&
+                !looksLikeCode(line)
+            ) || '';
+            textCard = !!cardHeadline;
+        }
+
+        if (storeIndex >= 0 && !cardHeadline) {
             const storeLine = lines[storeIndex];
             const storeMatch = storeLine.match(/google play(?: store)?|apple app store|app store/i);
             if (storeMatch && storeMatch.index > 0) {
@@ -1564,11 +1731,11 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     while time.time() - start_time < max_wait_seconds:
         try:
             ranked = get_ranked_non_video_targets(page)
-            targets = [item[1] for item in ranked]
+            targets = [item[1] for item in ranked if item[2] == "iframe"]
         except Exception:
             targets = []
         if not targets:
-            targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
+            targets = get_active_ad_frames(page)
 
         for target in targets:
             data = read_target(target)
@@ -1603,6 +1770,7 @@ def extract_visible_app_name(page):
     js = r"""
     () => {
         const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+        const isAction = value => /^(install|get|download|learn more)\b/i.test(clean(value));
         const visible = el => {
             if (!el) return false;
             const r = el.getBoundingClientRect();
@@ -1618,14 +1786,14 @@ def extract_visible_app_name(page):
             for (let depth = 0; parent && depth < 3; depth++, parent = parent.parentElement) {
                 const lines = (parent.innerText || '').split(/\n+/).map(clean).filter(Boolean);
                 const index = lines.findIndex(line => storeLabel.test(line));
-                if (index > 0 && lines[index - 1].length <= 80) return lines[index - 1];
+                if (index > 0 && lines[index - 1].length <= 80 && !isAction(lines[index - 1])) return lines[index - 1];
             }
         }
         for (const selector of ['[class*="app-name"]', '[class*="app-title"]', '[data-testid*="app-name"]']) {
             for (const el of document.querySelectorAll(selector)) {
                 if (!visible(el)) continue;
                 const value = clean(el.innerText || el.textContent);
-                if (value && value.length <= 80) return value;
+                if (value && value.length <= 80 && !isAction(value)) return value;
             }
         }
         return '';
@@ -1633,11 +1801,11 @@ def extract_visible_app_name(page):
     """
     try:
         ranked = get_ranked_non_video_targets(page)
-        targets = [ranked[0][1]] if ranked else []
+        targets = [ranked[0][1]] if ranked and ranked[0][2] == "iframe" else []
     except Exception:
         targets = []
     if not targets:
-        targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
+        targets = get_active_ad_frames(page)
 
     for target in targets:
         try:
@@ -1734,13 +1902,15 @@ def has_visible_image_creative(page, has_text=False):
     }
     """
 
-    try:
-        ranked = get_ranked_non_video_targets(page)
-        targets = [ranked[0][1]] if ranked else []
-    except Exception:
-        targets = []
+    # The active preview is spatially identified; page-wide fallback scanning
+    # can mistake a neighboring Google ad's artwork for this creative's media.
+    targets = get_active_ad_frames(page)
     if not targets:
-        targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
+        try:
+            ranked = get_ranked_non_video_targets(page)
+            targets = [ranked[0][1]] if ranked else []
+        except Exception:
+            targets = []
 
     for target in targets:
         try:
